@@ -1,0 +1,281 @@
+import pandas as pd
+import numpy as np
+import numpy as np
+from lightgbm import lgb
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+df_holiday = pd.read_csv("gdz/holidays.csv")
+df_train = pd.read_csv("gdz/train.csv")
+df_weather = pd.read_csv("gdz/weather.csv")
+df_test = pd.read_csv("gdz/test.csv")
+df_submission = pd.read_csv("gdz/sample_submission.csv")
+
+df_test["tarih"] = pd.to_datetime(df_test["tarih"])
+df_train['tarih'] = pd.to_datetime(df_train['tarih'])
+df_weather.rename(columns={"name":"ilce"},inplace=True)
+
+
+
+def create_multi_index(dataframe):
+
+    multi_idx = pd.MultiIndex.from_product(
+        [pd.date_range(dataframe.tarih.min(), dataframe.tarih.max()), dataframe.ilce.unique()],
+        names=["tarih", "ilce"]
+    )
+    dataframe = dataframe.set_index(["tarih", "ilce"]).reindex(multi_idx, fill_value=0).reset_index()
+    return dataframe
+
+def preprocess_weather_data(df_weather):
+    df_weather['delta_wind_speed'] = df_weather.groupby('ilce')['wind_speed_10m:ms'].diff()
+
+    def angle_difference(angle1, angle2):
+        diff = (angle2 - angle1 + 180) % 360 - 180
+        return diff + 360 if diff < -180 else diff
+
+    df_weather['prev_wind_dir'] = df_weather.groupby('ilce')['wind_dir_10m:d'].shift(1)
+    df_weather['delta_wind_dir'] = df_weather.apply(lambda row: angle_difference(row['prev_wind_dir'], row['wind_dir_10m:d']), axis=1)
+    df_weather['delta_global_rad'] = df_weather.groupby('ilce')['global_rad:W'].diff()
+
+    df_weather["speedxdir"] = df_weather["delta_wind_speed"] * df_weather["delta_wind_dir"]
+    df_weather["speedxrad"] = df_weather["delta_wind_speed"] * df_weather["delta_global_rad"]
+    df_weather["dirxrad"] = df_weather["delta_wind_dir"] * df_weather["delta_global_rad"]
+    df_weather["speedxdirxrad"] = df_weather["delta_wind_dir"] * df_weather["delta_global_rad"] * df_weather["delta_wind_speed"]
+
+    temperature_threshold_high = 38
+    temperature_threshold_low = 0
+    df_weather['high_temp_flag'] = (df_weather['t_2m:C'] > temperature_threshold_high).astype(int)
+    df_weather['low_temp_flag'] = (df_weather['t_2m:C'] < temperature_threshold_low).astype(int)
+
+    wind_threshold = 14
+    df_weather['high_wind_flag'] = (df_weather['wind_speed_10m:ms'] > wind_threshold).astype(int)
+
+    precip_threshold = 85
+    df_weather['heavy_precip_flag'] = (df_weather['prob_precip_1h:p'] > precip_threshold).astype(int)
+    df_weather['no_precip_flag'] = (df_weather['prob_precip_1h:p'] == 0).astype(int)
+
+    humidity_high_threshold = 95
+    humidity_low_threshold = 15
+    df_weather['high_humidity_flag'] = (df_weather['relative_humidity_2m:p'] > humidity_high_threshold).astype(int)
+    df_weather['low_humidity_flag'] = (df_weather['relative_humidity_2m:p'] < humidity_low_threshold).astype(int)
+
+    df_weather['temp_humidity_interaction'] = df_weather['t_2m:C'] * df_weather['relative_humidity_2m:p']
+    df_weather['wind_rain_interaction'] = df_weather['wind_speed_10m:ms'] * df_weather['prob_precip_1h:p']
+
+    a = 17.625
+    b = 243.04
+    df_weather["dew_point"] = ((b * (np.log(df_weather["relative_humidity_2m:p"]/100) +
+                                    (a*df_weather["t_2m:C"]/(b + df_weather["t_2m:C"])))) /
+                               (a - (np.log(df_weather["relative_humidity_2m:p"]/100) +
+                                     (a*df_weather["t_2m:C"]/(b + df_weather["t_2m:C"])))))
+
+    df_weather = df_weather.sort_values(['ilce', 'date'])
+    return df_weather
+
+def calculate_features(group):
+    group['dew_point_gradient'] = group['dew_point'].diff() / group['date'].diff().dt.total_seconds() * 3600
+    group['temp_dew_diff'] = group['t_2m:C'] - group['dew_point']
+    group['humidity_dew_interaction'] = group['relative_humidity_2m:p'] * group['dew_point']
+    group['wind_dew_interaction'] = group['wind_speed_10m:ms'] * group['dew_point']
+    group['dew_point_category'] = pd.cut(group['dew_point'], bins=[-np.inf, 5.531153, 9.821538, 13.63102, np.inf], labels=['low', 'moderate', 'high', 'very high'])
+    group['dew_point_rolling_avg_3h'] = group['dew_point'].rolling(window=3).mean()
+    group['dew_point_rolling_std_3h'] = group['dew_point'].rolling(window=3).std()
+    group['dew_point_rolling_avg_6h'] = group['dew_point'].rolling(window=6).mean()
+    group['dew_point_rolling_std_6h'] = group['dew_point'].rolling(window=6).std()
+    group['dew_point_rolling_avg_12h'] = group['dew_point'].rolling(window=12).mean()
+    group['dew_point_rolling_std_12h'] = group['dew_point'].rolling(window=12).std()
+    group['dew_point_rolling_avg_24h'] = group['dew_point'].rolling(window=24).mean()
+    group['dew_point_rolling_std_24h'] = group['dew_point'].rolling(window=24).std()
+    return group
+
+def calculate_temp_anomaly_macd(df_weather):
+    df_weather.set_index('date', inplace=True)
+    monthly_avg_temp = df_weather.groupby(['ilce', lambda x: x.month])['t_2m:C'].transform('mean')
+    df_weather['temp_seasonal_anomaly'] = df_weather['t_2m:C'] - monthly_avg_temp
+
+    df_weather['temp_12h_ema'] = df_weather.groupby('ilce')['t_2m:C'].transform(lambda x: x.ewm(span=12, adjust=False).mean())
+    df_weather['temp_26h_ema'] = df_weather.groupby('ilce')['t_2m:C'].transform(lambda x: x.ewm(span=26, adjust=False).mean())
+    df_weather['temp_macd'] = df_weather['temp_12h_ema'] - df_weather['temp_26h_ema']
+    df_weather['temp_macd_signal'] = df_weather.groupby('ilce')['temp_macd'].transform(lambda x: x.ewm(span=9, adjust=False).mean())
+    df_weather['temp_macd_histogram'] = df_weather['temp_macd'] - df_weather['temp_macd_signal']
+
+    return df_weather
+
+def calculate_wind_speed_macd(df_weather):
+    df_weather['wind_speed_12h_ema'] = df_weather.groupby('ilce')['wind_speed_10m:ms'].transform(lambda x: x.ewm(span=12, adjust=False).mean())
+    df_weather['wind_speed_26h_ema'] = df_weather.groupby('ilce')['wind_speed_10m:ms'].transform(lambda x: x.ewm(span=26, adjust=False).mean())
+    df_weather['wind_speed_macd'] = df_weather['wind_speed_12h_ema'] - df_weather['wind_speed_26h_ema']
+    df_weather['wind_speed_macd_signal'] = df_weather.groupby('ilce')['wind_speed_macd'].transform(lambda x: x.ewm(span=9, adjust=False).mean())
+    df_weather['wind_speed_macd_histogram'] = df_weather['wind_speed_macd'] - df_weather['wind_speed_macd_signal']
+    return df_weather
+
+def aggregate_daily(df_weather):
+    daily_df = df_weather.groupby([pd.Grouper(freq='D'), 'ilce']).agg({
+        'lat': 'mean',
+        'lon': 'mean',
+        't_2m:C': ['mean', 'max', 'min'],
+        'effective_cloud_cover:p': ['mean', 'max', 'min'],
+        'global_rad:W': ['mean', 'max', 'min'],
+        'relative_humidity_2m:p': ['mean', 'max', 'min'],
+        'wind_dir_10m:d': ['mean', 'max', 'min'],
+        'wind_speed_10m:ms': ['mean', 'max', 'min'],
+        'prob_precip_1h:p': ['mean', 'max', 'min'],
+        't_apparent:C': ['mean', 'max', 'min'],
+        "delta_wind_speed": ['mean', 'max', 'min'],
+        "prev_wind_dir": ['mean', 'max', 'min'],
+        "delta_wind_dir": ['mean', 'max', 'min'],
+        "delta_global_rad": ['mean', 'max', 'min'],
+        "speedxdir": ['mean', 'max', 'min'],
+        "speedxrad": ['mean', 'max', 'min'],
+        "dirxrad": ['mean', 'max', 'min'],
+        "speedxdirxrad": ['mean', 'max', 'min'],
+        "high_temp_flag": ["sum"],
+        "low_temp_flag": ["sum"],
+        "high_wind_flag": ["sum"],
+        "heavy_precip_flag": ["sum"],
+        "no_precip_flag": ["sum"],
+        "high_humidity_flag": ["sum"],
+        "low_humidity_flag": ["sum"],
+        "temp_humidity_interaction": ['mean', 'max', 'min'],
+        "wind_rain_interaction": ['mean', 'max', 'min'],
+        "dew_point": ['mean', 'max', 'min'],
+        "temp_seasonal_anomaly": ['mean', 'max', 'min'],
+        "temp_12h_ema": ['mean', 'max', 'min'],
+        "temp_26h_ema": ['mean', 'max', 'min'],
+        "temp_macd": ['mean', 'max', 'min'],
+        "temp_macd_signal": ['mean', 'max', 'min'],
+        "temp_macd_histogram": ['mean', 'max', 'min'],
+        "wind_speed_12h_ema": ['mean', 'max', 'min'],
+        "wind_speed_26h_ema": ['mean', 'max', 'min'],
+        "wind_speed_macd": ['mean', 'max', 'min'],
+        "wind_speed_macd_signal": ['mean', 'max', 'min'],
+        "wind_speed_macd_histogram": ['mean', 'max', 'min'],
+        "temp_dew_diff": ['mean', 'max', 'min'],
+        "humidity_dew_interaction": ['mean', 'max', 'min'],
+        "wind_dew_interaction": ['mean', 'max', 'min'],
+        "dew_point_category": lambda x: pd.Series.mode(x)[0],
+        "dew_point_rolling_avg_3h": ['mean', 'max', 'min'],
+        "dew_point_rolling_std_3h": ['mean', 'max', 'min'],
+        "dew_point_rolling_avg_6h": ['mean', 'max', 'min'],
+        "dew_point_rolling_std_6h": ['mean', 'max', 'min'],
+        "dew_point_rolling_avg_12h": ['mean', 'max', 'min'],
+        "dew_point_rolling_std_12h": ['mean', 'max', 'min'],
+        "dew_point_rolling_avg_24h": ['mean', 'max', 'min'],
+        "dew_point_rolling_std_24h": ['mean', 'max', 'min'],
+        "dew_point_gradient": ['mean', 'max', 'min']
+    })
+
+    daily_df.columns = ['_'.join(col).strip() for col in daily_df.columns.values]
+    daily_df.reset_index(inplace=True)
+    return daily_df
+
+def merge_datasets(df_train, daily_df, df_holiday):
+    df_train.rename(columns={'tarih': "date"}, inplace=True)
+    df_train["date"] = pd.to_datetime(df_train["date"])
+    daily_df["ilce"] = daily_df["ilce"].str.lower()
+    df_merged = df_train.merge(daily_df, how='left', on=["date", "ilce"]).sort_values(by=["date", "ilce"], ascending=True)
+
+    df_holiday["date"] = df_holiday["Yıl"].astype(str) + "-" + df_holiday["Ay"].astype(str) + "-" + df_holiday["Gün"].astype(str)
+    df_holiday["date"] = pd.to_datetime(df_holiday["date"])
+
+    df_holiday['flag'] = 1
+    df_merged = df_merged.merge(df_holiday[["date", "flag"]], how='left', on=["date"])
+    df_merged["flag"].fillna(0, inplace=True)
+    return df_merged
+
+def mevsimler(month):
+    if month in [12, 1, 2]:
+        return "Winter"
+    elif month in [3, 4, 5]:
+        return "Spring"
+    elif month in [6, 7, 8]:
+        return "Summer"
+    else:
+        return "Autumn"
+
+def create_date_features(df):
+    df['month'] = df.date.dt.month
+    df['day_of_month'] = df.date.dt.day
+    df['day_of_year'] = df.date.dt.dayofyear
+    df['day_of_week'] = df.date.dt.dayofweek + 1
+    df['year'] = df.date.dt.year
+    df["is_wknd"] = (df.date.dt.dayofweek >= 5).astype(int)
+    df['is_month_start'] = df.date.dt.is_month_start.astype(int)
+    df['is_month_end'] = df.date.dt.is_month_end.astype(int)
+    df["Days_name"] = df.date.dt.day_name()
+    df["quarter"] = df.date.dt.quarter
+    df["season"] = df["month"].apply(mevsimler)
+    df['is_year_start'] = df.date.dt.is_year_start.astype("int8")
+    df['is_year_end'] = df.date.dt.is_year_end.astype("int8")
+    first_day = df["date"].dt.to_period('A').dt.start_time.min()
+    df['weeks_of_year'] = ((df["date"] - first_day).dt.days / 7).astype(int) + 1
+    df['weeks_of_year'] = ((df['weeks_of_year'] % 52) + 1)
+    return df
+
+def encode_categorical(df):
+    df["ilce"] = df["ilce"].astype("category")
+    df["season"] = df["season"].astype("category")
+    df["Days_name"] = df["Days_name"].astype("category")
+    df["dew_point_category_<lambda>"] = df["dew_point_category_<lambda>"].astype("category")
+    return df
+
+
+
+# Applying All Functions
+
+df_train = create_multi_index(df_train)
+df_test = create_multi_index(df_test)
+
+df_weather = preprocess_weather_data(df_weather)
+df_weather = df_weather.groupby('ilce').apply(calculate_features).reset_index(drop=True)
+df_weather = calculate_temp_anomaly_macd(df_weather)
+df_weather = calculate_wind_speed_macd(df_weather)
+daily_df = aggregate_daily(df_weather)
+
+df_train = merge_datasets(df_train, daily_df, df_holiday)
+df_train = create_date_features(df_train)
+df_train = encode_categorical(df_train)
+
+df_test = merge_datasets(df_test, daily_df, df_holiday)
+df_test = create_date_features(df_test)
+df_test = encode_categorical(df_test)
+
+
+df_train["ilce"] = df_train["ilce"].astype("category")
+df_train["season"] = df_train["season"].astype("category")
+df_train["Days_name"] = df_train["Days_name"].astype("category")
+df_train["dew_point_category_<lambda>"] = df_train["dew_point_category_<lambda>"].astype("category")
+
+
+df_test["ilce"] = df_test["ilce"].astype("category")
+df_test["season"] = df_test["season"].astype("category")
+df_test["Days_name"] = df_test["Days_name"].astype("category")
+df_test["dew_point_category_<lambda>"] = df_test["dew_point_category_<lambda>"].astype("category")
+
+
+
+df_train.columns = [col.replace('{', '').replace('}', '').replace(':', '').replace(',', '').replace('"', '') for col in df_train.columns]
+df_test.columns = [col.replace('{', '').replace('}', '').replace(':', '').replace(',', '').replace('"', '') for col in df_test.columns]
+
+features = [col for col in df_train.columns if col not in ["bildirimsiz_sum","date"]]
+
+X_train = df_train[features]
+X_test = df_test[features]
+y_train = df_train[target]
+
+
+model = lgb.LGBMRegressor()
+model.fit(X_train, y_train, categorical_feature=['ilce',"season","Days_name","dew_point_category_<lambda>"])
+
+y_pred = model.predict(X_test)
+y_pred = y_pred.round()
+
+X_test["bildirimsiz_sum"] = y_pred
+
+submission = X_test[["bildirimsiz_sum","ilce"]]
+submission.reset_index(inplace=True)
+submission["unique_id"] = submission["date"].astype(str) + "-" + submission["ilce"].astype(str)
+df_submission.drop("bildirimsiz_sum", axis=1, inplace=True)
+df_submission.merge(submission[["unique_id","bildirimsiz_sum"]],on="unique_id",how="left").to_csv("submission.csv",index=False)
+
+
+

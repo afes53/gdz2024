@@ -270,6 +270,8 @@ for ilce in train["ilce"].unique():
      train[train["ilce"] == ilce] = extreme(train[train["ilce"] == ilce])
 
 features = [col for col in df_train.columns if col not in ["bildirimsiz_sum","date"]]
+target = ["bildirimsiz_sum"]
+
 
 X_train = df_train[features]
 X_test = df_test[features]

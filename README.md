@@ -11,7 +11,9 @@ Electricity distribution companies aim to ensure the continuity and quality of e
 The dataset includes:
 
 Weather Data: Information on temperature, wind speed, wind direction, cloud cover, solar radiation, humidity, and precipitation probability.
+
 Holiday Data: Details of holidays and special days.
+
 Outage Data: Historical data on unplanned power outages.
 
 ## Features

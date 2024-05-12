@@ -33,9 +33,13 @@ We utilized LightGBM for regression, leveraging its efficiency and capability to
 ## Preprocessing Steps
 
 Weather Data Preprocessing: Creation of delta and interaction features.
+
 Feature Engineering: Development of anomalies and interaction features.
+
 Data Aggregation: Aggregation of weather data to daily level.
+
 Merging Datasets: Combining weather, outage, and holiday data.
+
 Categorical Encoding: Encoding categorical features for the model.
 
 ## Results

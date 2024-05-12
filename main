@@ -266,8 +266,8 @@ def extreme(dataframe):
     filtered_df.loc[extremes.index,"bildirimsiz_sum"] = np.nan
     return filtered_df
 
-for ilce in train["ilce"].unique():
-     train[train["ilce"] == ilce] = extreme(train[train["ilce"] == ilce])
+for ilce in df_train["ilce"].unique():
+     df_train[df_train["ilce"] == ilce] = extreme(df_train[df_train["ilce"] == ilce])
 
 features = [col for col in df_train.columns if col not in ["bildirimsiz_sum","date"]]
 target = ["bildirimsiz_sum"]

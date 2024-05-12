@@ -21,9 +21,13 @@ Outage Data: Historical data on unplanned power outages.
 Key features engineered for the model include:
 
 Weather Interaction Features: Combinations of wind speed, precipitation probability, and solar radiation.
+
 Dew Point Analysis: Dew point, its gradient, and interactions with other weather variables.
+
 Gust Analysis: Examination of wind gust impacts.
+
 Temperature Anomalies: MACD-based calculation of temperature anomalies.
+
 Wind Speed Anomalies: MACD-based calculation of wind speed anomalies.
 
 ## Model

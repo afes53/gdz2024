@@ -2,16 +2,6 @@
 ## Overview
 Welcome to the repository for the Gdz Elektrik Datathon! This project focuses on predicting the number of unplanned power outages at the district level, utilizing a variety of meteorological data and special day information. Our team achieved a ranking of 34th out of 184 teams, placing us in the top 18% with an MAE score of 1.81071.
 
-## Table of Contents
-
-Project Description
-Data
-Features
-Model
-Results
-Contributors
-Acknowledgements
-  
 ## Project Description
 
 Electricity distribution companies aim to ensure the continuity and quality of energy. This competition tasked data scientists with predicting the number of unplanned outages in GDZ's service areas. The project involved developing a model to predict daily unplanned outage counts at the district level using meteorological data and special day information.
